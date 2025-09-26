@@ -1,0 +1,14 @@
+/data
+/checkpoints
+/experiments
+/unsloth_compiled_cache
+
+data/
+checkpoints/
+experiments/
+unsloth_compiled_cache/
+*.ckpt
+*.pt
+*.bin
+pycache/
+__pycache__/
