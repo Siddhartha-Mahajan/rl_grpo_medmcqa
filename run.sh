@@ -19,7 +19,14 @@ echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 # Run the pipeline end-to-end with moderate defaults
 # This runs run.py all (which calls download->prep->baseline->sft->grpo->eval)
-python run.py all
+# python run.py download
+# python run.py prep
+# python run.py baseline
+# python run.py sft
+# python run.py grpo
+python run.py eval
+
+
 
 
 echo "All done. Check checkpoints/ and experiments/ for outputs."

@@ -12,3 +12,5 @@ unsloth_compiled_cache/
 *.bin
 pycache/
 __pycache__/
+log*
+plot*

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-run.py — compact pipeline for:
-  - downloading MedMCQA (HF: openlifescienceai/medmcqa)
-  - building chat template (GRPO / reasoning markers)
-  - formatting dataset for SFT/GRPO
-  - baseline evaluation with Qwen 4B (unsloth wrapper)
-  - SFT pre-finetune to teach formatting (LoRA)
-  - GRPO training (LoRA)
-  - inference/evaluation
+run.py — compact pipeline for MedMCQA with validation used for all testing.
+  - download: write processed JSONL per split (train/validation/test if present)
+  - prep: format train + validation (ignore test)
+  - baseline: evaluate on validation split (batched, labeled examples only)
+  - sft: SFT pre-finetune on train split (LoRA)
+  - grpo: GRPO training on train split (LoRA), then quick eval on validation
+  - eval: run inference on a handful of validation prompts using saved LoRA
 
 Usage:
   python run.py download
@@ -18,43 +17,41 @@ Usage:
   python run.py eval
   python run.py all
 
-Make sure to install required packages first (see requirements.txt).
-This script expects rewards.py to be present in the same directory.
+Notes:
+ - This script purposely uses the validation split for evaluation and ignores test.
+ - Ensure rewards.py exists for GRPO.
 """
-
 import os
-import sys
 import json
 import argparse
 import pathlib
-import time
-from typing import List, Dict, Any
+from typing import List, Dict
 import torch
-# Force using CUDA:0
+
+# force a visible GPU device if not set externally
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 DEVICE = "cuda:0"
 
-# ---- imports that may be heavy ----
+# optional heavy libs guarded
 try:
     from unsloth import FastLanguageModel
 except Exception:
     FastLanguageModel = None
+
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
-# unsloth and vllm/trl imports
 
 try:
     from trl import SFTTrainer, SFTConfig, GRPOTrainer, GRPOConfig
 except Exception:
     SFTTrainer = SFTConfig = GRPOTrainer = GRPOConfig = None
+
 try:
     from vllm import SamplingParams
 except Exception:
     SamplingParams = None
-from safetensors import safe_open
 
-
-# Import rewards module (separate file)
+# rewards.py expected in same folder
 try:
     from rewards import (
         match_format_exactly,
@@ -62,17 +59,15 @@ try:
         check_answer,
         check_numbers,
     )
-except Exception as e:
-    print("Could not import rewards.py — please ensure rewards.py exists in the same folder.")
-    # We'll continue; grpo won't run until rewards exist.
+except Exception:
     match_format_exactly = match_format_approximately = check_answer = check_numbers = None
-
+    print("Warning: rewards.py not found or failed to import — GRPO will not run until it's fixed.")
 
 # --------------------------
-# Config block (edit here)
+# Config
 # --------------------------
 CONFIG = {
-    "model_name": "unsloth/Qwen3-4B-Base",  # default; change to your HF id if needed
+    "model_name": "unsloth/Qwen3-4B-Base",
     "max_seq_length": 2048,
     "lora_rank": 32,
     "gpu_memory_utilization": 0.9,
@@ -83,7 +78,6 @@ CONFIG = {
     "preformat_lora_name": "preformat_lora",
     "grpo_lora_name": "grpo_lora",
     "device": DEVICE,
-    # SFT hyperparams
     "sft": {
         "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 1,
@@ -92,7 +86,6 @@ CONFIG = {
         "learning_rate": 2e-4,
         "logging_steps": 5,
     },
-    # GRPO hyperparams (small by default; adjust for longer runs)
     "grpo": {
         "temperature": 1.0,
         "learning_rate": 5e-6,
@@ -104,8 +97,8 @@ CONFIG = {
         "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 1,
     },
+    "eval_batch_size": 16,
 }
-
 
 # --------------------------
 # Utilities
@@ -126,124 +119,102 @@ def json_load(path):
 
 
 # --------------------------
-# Dataset download + processing
+# Download + process (per-split)
 # --------------------------
-def download_medmcqa(out_path: str):
+def download_medmcqa(out_dir: str):
     """
-    Downloads the Hugging Face MedMCQA dataset (openlifescienceai/medmcqa).
-    Normalizes option fields like 'opa','opb','opc','opd' (or a list 'options').
-    Detects the correct answer via 'cop' (index), 'answer', 'label', or letter label.
-    Saves processed JSONL entries with:
-      { 'id', 'question', 'options': [...], 'answer_label': 'C', 'answer_text': 'Atrophy', 'raw': ex }
+    Download MedMCQA and write processed JSONL per split (whatever load_dataset returns).
+    Outputs files medmcqa_processed.<split>.jsonl in out_dir.
     """
-    makedirs(CONFIG["data_dir"])
-    print("Loading dataset: openlifescienceai/medmcqa ... (may take a minute)")
-    ds = load_dataset("openlifescienceai/medmcqa", split="train")
-    out = []
-    for i, ex in enumerate(ds):
-        q = ex.get("question") or ex.get("Question") or ex.get("prompt") or ""
-        # gather option fields robustly (look for opa/opb/... or option1..)
-        options = []
-        # common keys that might hold options
-        # first try an 'options' or 'choices' list
-        if ex.get("options") and isinstance(ex.get("options"), (list, tuple)):
-            options = [str(x).strip() for x in ex.get("options")]
-        elif ex.get("choices") and isinstance(ex.get("choices"), (list, tuple)):
-            options = [str(x).strip() for x in ex.get("choices")]
-        else:
-            # collect keys starting with 'op' followed by letter or digit (opa, opb, opc, op1, op2...)
-            op_items = []
-            for k, v in ex.items():
-                if isinstance(k, str) and k.lower().startswith("op") and v is not None:
-                    # record (key, text)
-                    op_items.append((k, str(v).strip()))
-            # sort by key so opa, opb, opc come in order
-            if op_items:
-                op_items = sorted(op_items, key=lambda x: x[0])
-                options = [t for _, t in op_items]
+    makedirs(out_dir)
+    print("Loading dataset: openlifescienceai/medmcqa ...")
+    ds_all = load_dataset("openlifescienceai/medmcqa")
+    saved = {}
+    for split in ds_all.keys():
+        ds = ds_all[split]
+        out = []
+        for i, ex in enumerate(ds):
+            q = ex.get("question") or ex.get("Question") or ex.get("prompt") or ""
+            # gather options robustly
+            options = []
+            if ex.get("options") and isinstance(ex.get("options"), (list, tuple)):
+                options = [str(x).strip() for x in ex.get("options")]
+            elif ex.get("choices") and isinstance(ex.get("choices"), (list, tuple)):
+                options = [str(x).strip() for x in ex.get("choices")]
+            else:
+                op_items = []
+                for k, v in ex.items():
+                    if isinstance(k, str) and k.lower().startswith("op") and v is not None:
+                        op_items.append((k, str(v).strip()))
+                if op_items:
+                    op_items = sorted(op_items, key=lambda x: x[0])
+                    options = [t for _, t in op_items]
+            if not options:
+                for k in ["option1", "option2", "option3", "option4"]:
+                    if ex.get(k):
+                        options.append(str(ex.get(k)).strip())
 
-        # fallback: try option1..option4
-        if not options:
-            for k in ["option1", "option2", "option3", "option4"]:
-                if ex.get(k):
-                    options.append(str(ex.get(k)).strip())
+            answer_label = None
+            answer_text = None
+            possible_ans = None
+            for cand in ["cop", "answer", "label", "ans", "correct", "correct_option"]:
+                if cand in ex and ex[cand] not in (None, ""):
+                    possible_ans = ex[cand]
+                    break
 
-        # determine answer index/label/text
-        answer_label = None
-        answer_text = None
-        # possible answer fields
-        possible_ans = None
-        for cand in ["cop", "answer", "label", "ans", "correct", "correct_option"]:
-            if cand in ex and ex[cand] not in (None, ""):
-                possible_ans = ex[cand]
-                break
-
-        if possible_ans is not None:
-            # If it's numeric index:
-            try:
-                idx = int(possible_ans)
-                # handle 1-based or 0-based indices
-                if 0 <= idx < len(options):
-                    chosen_idx = idx
-                elif 1 <= idx <= len(options):
-                    chosen_idx = idx - 1
-                else:
-                    chosen_idx = None
-                if chosen_idx is not None:
-                    answer_text = options[chosen_idx]
-                    answer_label = chr(ord("A") + chosen_idx)
-            except Exception:
-                # if it's a letter like 'A' or 'c'
-                s = str(possible_ans).strip()
-                if len(s) == 1 and s.isalpha():
-                    letter = s.upper()
-                    idx = ord(letter) - ord("A")
+            if possible_ans is not None:
+                try:
+                    idx = int(possible_ans)
                     if 0 <= idx < len(options):
-                        answer_label = letter
-                        answer_text = options[idx]
-                else:
-                    # maybe the dataset already contains the answer text; try to match to one of options
-                    s = s.strip()
-                    for j, opt in enumerate(options):
-                        if s.lower() == opt.lower() or s in opt:
-                            answer_text = opt
-                            answer_label = chr(ord("A") + j)
-                            break
-                    # if still none, store the raw string as answer_text
-                    if answer_text is None:
-                        answer_text = s
-                        answer_label = None
+                        chosen_idx = idx
+                    elif 1 <= idx <= len(options):
+                        chosen_idx = idx - 1
+                    else:
+                        chosen_idx = None
+                    if chosen_idx is not None:
+                        answer_text = options[chosen_idx]
+                        answer_label = chr(ord("A") + chosen_idx)
+                except Exception:
+                    s = str(possible_ans).strip()
+                    if len(s) == 1 and s.isalpha():
+                        letter = s.upper()
+                        idx = ord(letter) - ord("A")
+                        if 0 <= idx < len(options):
+                            answer_label = letter
+                            answer_text = options[idx]
+                    else:
+                        s = s.strip()
+                        for j, opt in enumerate(options):
+                            if s.lower() == opt.lower() or s in opt:
+                                answer_text = opt
+                                answer_label = chr(ord("A") + j)
+                                break
+                        if answer_text is None:
+                            answer_text = s
+                            answer_label = None
 
-        out.append({
-            "id": i,
-            "question": q,
-            "options": options,
-            "answer_label": answer_label,   # e.g., "C"
-            "answer_text": answer_text,     # e.g., "Atrophy"
-            "raw": ex,
-        })
+            out.append({
+                "id": i,
+                "question": q,
+                "options": options,
+                "answer_label": answer_label,
+                "answer_text": answer_text,
+                "raw": ex,
+            })
 
-    # Save to JSONL
-    makedirs(os.path.dirname(out_path) or ".")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        for row in out:
-            fh.write(json.dumps(row) + "\n")
-    print(f"Saved processed MedMCQA to {out_path} (n={len(out)})")
-    return out
+        out_path = os.path.join(out_dir, f"medmcqa_processed.{split}.jsonl")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            for row in out:
+                fh.write(json.dumps(row) + "\n")
+        print(f"Saved processed split '{split}' to {out_path} (n={len(out)})")
+        saved[split] = out_path
+    return saved
 
 
 # --------------------------
-# Chat template + tokenizer helpers
+# Chat template + helpers
 # --------------------------
 def build_chat_template(tokenizer):
-    """
-    Build the jinja chat template for reasoning traces and apply to tokenizer.
-    Uses markers like:
-      reasoning_start = "<start_working_out>"
-      reasoning_end   = "<end_working_out>"
-      solution_start  = "<SOLUTION>"
-      solution_end    = "</SOLUTION>"
-    """
     reasoning_start = "<start_working_out>"
     reasoning_end = "<end_working_out>"
     solution_start = "<SOLUTION>"
@@ -274,16 +245,11 @@ def build_chat_template(tokenizer):
         "{% if add_generation_prompt %}" + reasoning_start + "{% endif %}"
     )
 
-    # apply to huggingface tokenizer if supports chat_template attribute (unsloth tokenizer does)
     try:
         tokenizer.chat_template = chat_template
-        print("Applied custom chat_template to tokenizer.")
     except Exception:
-        # fallback: store template in tokenizer object
         setattr(tokenizer, "chat_template", chat_template)
-        print("Stored chat_template attribute on tokenizer (fallback).")
 
-    # return markers for downstream
     return {
         "system_prompt": system_prompt,
         "reasoning_start": reasoning_start,
@@ -294,27 +260,16 @@ def build_chat_template(tokenizer):
 
 
 def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], add_generation_prompt: bool = True, tokenize: bool = False):
-    """
-    Helper wrapper similar to tokenizer.apply_chat_template used in Unslo th.
-    Behavior:
-      - If the tokenizer has attribute `apply_chat_template` AND tokenizer.chat_template is set: use it.
-      - Otherwise fall back to a manual concatenation rendering and optionally tokenize.
-    This avoids calling tokenizer.apply_chat_template when tokenizer.chat_template is not set,
-    which causes transformers to raise a ValueError.
-    """
-    # If tokenizer has a direct method and chat_template is already set, use it safely
+    # Prefer tokenizer.apply_chat_template if available, otherwise manual
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None) is not None:
         try:
             return tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, tokenize=tokenize)
-        except Exception as e:
-            # fall through to manual fallback if tokenizer.apply_chat_template unexpectedly fails
-            print("Warning: tokenizer.apply_chat_template failed, falling back to manual rendering:", e)
+        except Exception:
+            pass
 
-    # Manual fallback: produce a simple concatenated prompt with system prompt + user messages + generation marker
-    # Try to use tokenizer.chat_template content if present; otherwise build a simple default system prompt.
+    # manual fallback
     chat_template = getattr(tokenizer, "chat_template", None)
     if chat_template is None:
-        # create a concise system prompt that mirrors the main script's format
         system_prompt = (
             "You are given a problem.\n"
             "Think about the problem and provide your working out.\n"
@@ -322,10 +277,7 @@ def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], a
             "Then, provide your solution between <SOLUTION></SOLUTION>"
         )
     else:
-        # Extract the system_prompt from the template if possible (best-effort),
-        # otherwise fall back to the same concise system prompt.
         try:
-            # crude extraction: find the literal between "{{ '" and "' + eos_token"
             if "{{ '" in chat_template and "' + eos_token" in chat_template:
                 system_prompt = chat_template.split("{{ '")[1].split("' +")[0]
             else:
@@ -340,7 +292,6 @@ def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], a
                 "Then, provide your solution between <SOLUTION></SOLUTION>"
             )
 
-    # Build the concatenated text (system prompt + loop messages)
     pieces = []
     if messages and messages[0].get("role") == "system":
         pieces.append(messages[0]["content"])
@@ -350,7 +301,6 @@ def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], a
         loop_messages = messages
 
     for m in loop_messages:
-        # For assistant messages include eos-like newline to separate from next items
         pieces.append(m.get("content", ""))
 
     if add_generation_prompt:
@@ -359,31 +309,21 @@ def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], a
     raw = "\n".join(pieces)
 
     if tokenize:
-        # Use tokenizer.encode / return_tensors path depending on tokenizer capabilities
         try:
             enc = tokenizer(raw, return_tensors="pt")
-            # return token ids list (match earlier code's expected shape)
-            # If caller expects a list-of-ids, return that; else return raw enc dict
             if "input_ids" in enc:
                 return enc["input_ids"][0].tolist()
             return enc
-        except Exception as e:
-            # if tokenization fails, return the raw string so higher-level code can handle it
-            print("Warning: tokenizer() failed in fallback tokenize step:", e)
+        except Exception:
             return raw
 
     return raw
 
 
 # --------------------------
-# Data formatting for SFT/GRPO
+# Format dataset to chat-style (train + validation)
 # --------------------------
 def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: Dict[str, str], subset_limit: int = None):
-    """
-    Convert processed medmcqa jsonl into chat-format strings for SFT/GRPO.
-    Prompts explicitly include choices and request the MODEL to answer with the OPTION LABEL
-    (e.g., A, B, C) between <SOLUTION> and </SOLUTION>.
-    """
     makedirs(os.path.dirname(out_jsonl) or ".")
     system_prompt = markers["system_prompt"]
     reasoning_start = markers["reasoning_start"]
@@ -399,7 +339,6 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
             ex = json.loads(line)
             q = ex["question"]
             options = ex.get("options") or []
-            # Format choices with labels A., B., etc.
             if options:
                 labeled = [f"{chr(ord('A')+idx)}. {opt}" for idx, opt in enumerate(options)]
                 choices_text = "\n".join(labeled)
@@ -418,7 +357,6 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
                 {"role": "user", "content": prompt_text},
             ]
 
-            # If we have a gold label, include an assistant target using the labeling convention
             answer_label = ex.get("answer_label")
             answer_text = ex.get("answer_text")
             if answer_label is not None:
@@ -428,7 +366,6 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
                 )
                 messages.append({"role": "assistant", "content": assistant_content})
             elif answer_text is not None and options:
-                # attempt to find label from answer_text
                 label = None
                 for j, opt in enumerate(options):
                     if answer_text.strip().lower() == opt.strip().lower() or answer_text.strip() in opt:
@@ -441,7 +378,6 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
                     )
                     messages.append({"role": "assistant", "content": assistant_content})
                 else:
-                    # No reliable label -> include text answer in SOLUTION tags (less ideal)
                     assistant_content = (
                         f"{reasoning_start}Working...{reasoning_end}"
                         f"{solution_start}{answer_text}{solution_end}"
@@ -458,40 +394,152 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
 
 
 # --------------------------
-# Baseline evaluation
+# Helpers: extraction fallback
 # --------------------------
-def baseline_evaluate_model(model_name: str, formatted_jsonl: str, tokenizer_name: str = None, max_new_tokens: int = 64, limit: int = 100):
+import re
+
+def extract_solution_from_text(text: str, sol_start: str, sol_end: str):
+    if text is None:
+        return None
+    s = text.find(sol_start)
+    if s == -1:
+        return None
+    s2 = text.find(sol_end, s + len(sol_start))
+    if s2 == -1:
+        return text[s + len(sol_start):].strip()
+    return text[s + len(sol_start):s2].strip()
+
+
+def extract_pred_with_fallback(out: str, sol_start: str, sol_end: str, options: List[str] = None):
+    # 1) tags
+    sol = extract_solution_from_text(out, sol_start, sol_end)
+    if sol:
+        return sol.strip()
+    if not out:
+        return None
+    # 2) "Answer: C" style
+    m2 = re.search(r'(answer|ans|final)\s*[:\-]?\s*([A-D])\b', out, re.IGNORECASE)
+    if m2:
+        return m2.group(2).upper()
+    # 3) single letter A-D somewhere
+    m = re.search(r'\b([A-D])\b', out, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # 4) match option text if options provided
+    if options:
+        out_low = out.lower()
+        for idx, opt in enumerate(options):
+            if opt and opt.lower() in out_low:
+                return chr(ord("A") + idx)
+    return None
+
+
+# --------------------------
+# Baseline evaluation on validation (batched; labeled only)
+# --------------------------
+def baseline_evaluate_model(model_name: str, formatted_jsonl: str, tokenizer_name: str = None,
+                            max_new_tokens: int = 64, limit: int = 100, batch_size: int = None):
     """
-    Improved baseline evaluation:
-     - Reads gold label from answer_label / answer_text or falls back to raw.answer/cop.
-     - Uses tokenizer + transformers.generate in a safe way when FastLanguageModel not available.
-     - Tries to extract <SOLUTION>... </SOLUTION> from the generation and compare to gold label/text.
+    Baseline evaluation on the formatted JSONL (validation split in your pipeline).
+    This version *robustly* detects gold labels from multiple possible fields
+    (answer_label/answer_text at top-level, or inside raw; handles cop indices).
     """
-    print("Starting baseline evaluation...")
-    # load data
-    examples = []
+    import math
+    print("Starting baseline evaluation (robust label detection, batched)...")
+
+    # load rows (respect limit: if limit is None or <=0, load everything)
+    raw_rows = []
     with open(formatted_jsonl, "r", encoding="utf-8") as fh:
         for i, line in enumerate(fh):
-            if i >= limit:
+            if limit and limit > 0 and i >= limit:
                 break
-            examples.append(json.loads(line))
-    if len(examples) == 0:
-        print("No examples found.")
+            raw_rows.append(json.loads(line))
+    if not raw_rows:
+        print("No examples loaded from", formatted_jsonl)
         return
 
-    # load tokenizer
+    # helper: check whether an example has a usable gold (label or text or cop)
+    def get_gold_from_example(ex):
+        # return tuple (gold_label_or_none, gold_text_or_none)
+        # check top-level processed fields first
+        gl = ex.get("answer_label")
+        gt = ex.get("answer_text")
+        # then check raw dict
+        r = ex.get("raw") or {}
+        if (gl is None or gl == "") and isinstance(r, dict):
+            # some processed rows keep gold inside raw
+            if r.get("answer_label"):
+                gl = r.get("answer_label")
+            # sometimes gold text stored in 'answer' or 'answer_text'
+            if gt is None or gt == "":
+                if r.get("answer_text"):
+                    gt = r.get("answer_text")
+                elif r.get("answer"):
+                    gt = r.get("answer")
+            # cop index (could be 0 or 1-based, -1 meaning no label)
+            cop = r.get("cop", None)
+            if (gl is None or gl == "") and cop is not None and cop not in ("", None):
+                try:
+                    idx = int(cop)
+                    opts = r.get("options") or ex.get("options") or []
+                    # treat -1 as unlabeled
+                    if idx == -1:
+                        pass
+                    elif 0 <= idx < len(opts):
+                        gl = chr(ord("A") + idx)
+                        gt = gt or (opts[idx] if idx < len(opts) else None)
+                    elif 1 <= idx <= len(opts):
+                        # 1-based index
+                        gl = chr(ord("A") + (idx - 1))
+                        gt = gt or (opts[idx - 1] if idx - 1 < len(opts) else None)
+                except Exception:
+                    # non-integer cop could be text (treat as gold text)
+                    s = str(cop).strip()
+                    if s:
+                        gt = gt or s
+
+        # normalize empty strings -> None
+        if isinstance(gl, str) and gl.strip() == "":
+            gl = None
+        if isinstance(gt, str) and gt.strip() == "":
+            gt = None
+        return gl, gt
+
+    # split labeled vs unlabeled
+    labeled = []
+    unlabeled = []
+    for ex in raw_rows:
+        gl, gt = get_gold_from_example(ex)
+        if gl is not None or gt is not None:
+            # attach discovered gold to the example for reuse
+            ex["_gold_label"] = gl
+            ex["_gold_text"] = gt
+            labeled.append(ex)
+        else:
+            unlabeled.append(ex)
+
+    print(f"Loaded {len(raw_rows)} examples -> {len(labeled)} labeled, {len(unlabeled)} unlabeled (unlabeled will be skipped).")
+    if len(labeled) == 0:
+        print("No labeled examples found — cannot compute baseline accuracy. Check processed files or use a different split (train/validation).")
+        # show a small sample for debugging
+        if len(raw_rows) > 0:
+            print("Sample processed row (first):")
+            import pprint
+            pprint.pprint(raw_rows[0])
+        return
+
+    # prepare tokenizer + model
     if tokenizer_name is None:
         tokenizer_name = model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
     markers = build_chat_template(tokenizer)
 
-    # load model (prefer unsloth FastLanguageModel if available)
     model = None
     use_unsloth = False
     if FastLanguageModel is not None:
         try:
-            print("Loading model via Unslo th FastLanguageModel (preferred) ...")
-            model = FastLanguageModel.from_pretrained(
+            print("Attempting to load model via Unsloth FastLanguageModel ...")
+            model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name,
                 max_seq_length=CONFIG["max_seq_length"],
                 load_in_4bit=False,
@@ -501,37 +549,47 @@ def baseline_evaluate_model(model_name: str, formatted_jsonl: str, tokenizer_nam
             )
             use_unsloth = True
         except Exception as e:
-            print("FastLanguageModel load failed, falling back to transformers:", e)
+            print("Unsloth load failed, falling back to transformers:", e)
             model = None
 
     if model is None:
-        print("Using transformers AutoModelForCausalLM (may be slow / large).")
+        print("Loading base model via transformers (may be slower)...")
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(model_name).to(CONFIG["device"])
+
+    if batch_size is None:
+        batch_size = CONFIG.get("eval_batch_size", 8)
+
+    # build prompts for labeled examples
+    prompts = []
+    ex_list = []
+    for ex in labeled:
+        text = apply_chat_template_to_messages(tokenizer, ex["messages"], add_generation_prompt=True, tokenize=False)
+        prompts.append(text)
+        ex_list.append(ex)
 
     correct = 0
     total = 0
 
-    for ex in examples:
-        messages = ex["messages"]
-        # Must add generation prompt
-        text = apply_chat_template_to_messages(tokenizer, messages, add_generation_prompt=True, tokenize=False)
+    # batched generation / eval
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start:start + batch_size]
+        batch_exs = ex_list[start:start + batch_size]
+        out_texts = [""] * len(batch_prompts)
 
-        out = ""
         try:
             if use_unsloth and hasattr(model, "fast_generate"):
-                # Unslo th fast_generate expects a list of prompts
                 sampling_params = SamplingParams(temperature=1.0, max_tokens=max_new_tokens)
-                out = model.fast_generate(
-                    [text],
-                    sampling_params=sampling_params,
-                    lora_request=None,
-                )[0].outputs[0].text
+                results = model.fast_generate(batch_prompts, sampling_params=sampling_params, lora_request=None)
+                for i, r in enumerate(results):
+                    try:
+                        out_texts[i] = r.outputs[0].text
+                    except Exception:
+                        out_texts[i] = getattr(r, "text", "")
             else:
-                # transformers generate path (robust)
-                inputs = tokenizer(text, return_tensors="pt")
-                input_ids = inputs["input_ids"].to(CONFIG["device"])
-                attention_mask = inputs.get("attention_mask", None)
+                enc = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=CONFIG["max_seq_length"])
+                input_ids = enc["input_ids"].to(CONFIG["device"])
+                attention_mask = enc.get("attention_mask", None)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(CONFIG["device"])
 
@@ -543,127 +601,75 @@ def baseline_evaluate_model(model_name: str, formatted_jsonl: str, tokenizer_nam
                     eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else None,
                 )
 
-                # decode whole sequence, then remove the prompt portion to obtain only the new tokens
-                decoded = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                # decode the prompt tokens to find prompt length in chars
-                prompt_decoded = tokenizer.decode(input_ids[0], skip_special_tokens=False)
-                # If decoded starts with prompt_decoded, strip it to keep only model-generated suffix
-                if decoded.startswith(prompt_decoded):
-                    out = decoded[len(prompt_decoded):].strip()
-                else:
-                    out = decoded
-
+                for i in range(len(batch_prompts)):
+                    decoded = tokenizer.decode(gen_ids[i], skip_special_tokens=False)
+                    prompt_decoded = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=False)
+                    if decoded.startswith(prompt_decoded):
+                        out_texts[i] = decoded[len(prompt_decoded):].strip()
+                    else:
+                        out_texts[i] = decoded
         except Exception as e:
-            print("Generation error (continuing):", e)
-            out = ""
-
-        # extract solution between tags
-        sol = extract_solution_from_text(out, markers["solution_start"], markers["solution_end"])
-        # Determine gold answer robustly:
-        # Look for top-level 'answer_label' or 'answer_text' fields, then 'raw' nested fields (some entries nest the processed row)
-        gold_label = None
-        gold_text = None
-        if isinstance(ex.get("raw"), dict):
-            r = ex["raw"]
-            # sometimes the processed answer fields are nested inside r['raw'] again; test both
-            if "answer_label" in r and r.get("answer_label"):
-                gold_label = r.get("answer_label")
-            if "answer_text" in r and r.get("answer_text"):
-                gold_text = r.get("answer_text")
-            # fallback to top-level processed fields in 'ex' if present
-        if gold_label is None and "answer_label" in ex:
-            gold_label = ex.get("answer_label")
-        if gold_text is None and "answer_text" in ex:
-            gold_text = ex.get("answer_text")
-        # final fallback: older fields
-        if gold_text is None:
-            # sometimes dataset uses 'answer', 'cop'
-            if isinstance(ex.get("raw"), dict) and ex["raw"].get("answer"):
-                gold_text = ex["raw"].get("answer")
-            if isinstance(ex.get("raw"), dict) and ex["raw"].get("cop") is not None:
+            print("Batch generation failed at start", start, " — falling back to per-example. Exception:", e)
+            for i, p in enumerate(batch_prompts):
                 try:
-                    idx = int(ex["raw"].get("cop"))
-                    # cop sometimes 0-based or 1-based — choose 0-based if within range
-                    opts = ex["raw"].get("options") or ex.get("options", [])
-                    if 0 <= idx < len(opts):
-                        gold_label = chr(ord("A") + idx)
-                        gold_text = opts[idx]
-                    elif 1 <= idx <= len(opts):
-                        gold_label = chr(ord("A") + (idx-1))
-                        gold_text = opts[idx-1]
-                except Exception:
-                    pass
+                    inputs = tokenizer(p, return_tensors="pt").to(CONFIG["device"])
+                    gen_ids = model.generate(inputs["input_ids"], max_new_tokens=max_new_tokens)
+                    decoded = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+                    prompt_decoded = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=False)
+                    out_texts[i] = decoded[len(prompt_decoded):].strip() if decoded.startswith(prompt_decoded) else decoded
+                except Exception as e2:
+                    print("Per-example fallback failed:", e2)
+                    out_texts[i] = ""
 
-        # Determine match:
-        match = False
-        if gold_label is not None:
-            # If solution is label directly (A/B/C), compare labels
-            if sol is not None and sol.strip().upper() == str(gold_label).strip().upper():
-                match = True
-            # Also accept if sol contains the gold label (e.g., "Answer: C")
-            elif sol is not None and str(gold_label).strip().upper() in sol.strip().upper():
-                match = True
-            else:
-                match = False
-        elif gold_text is not None:
-            # Compare by text containment (case-insensitive)
-            if sol is not None and sol.strip().lower() in str(gold_text).strip().lower():
-                match = True
-            else:
-                match = False
-        else:
+        # evaluate outputs
+        for i, out in enumerate(out_texts):
+            ex = batch_exs[i]
+            options = ex.get("raw", {}).get("options") or ex.get("options") or None
+            pred = extract_pred_with_fallback(out, markers["solution_start"], markers["solution_end"], options=options)
+
+            # use gold we precomputed
+            gold_label = ex.get("_gold_label")
+            gold_text = ex.get("_gold_text")
+
             match = False
+            if gold_label is not None:
+                if pred is not None and str(pred).strip().upper() == str(gold_label).strip().upper():
+                    match = True
+                elif pred is not None and str(gold_label).strip().upper() in str(pred).strip().upper():
+                    match = True
+            elif gold_text is not None:
+                if pred is not None and str(pred).strip().lower() in str(gold_text).strip().lower():
+                    match = True
 
-        print(f"[{total+1}] gold_label={gold_label} gold_text={gold_text} | pred={sol} | match={match}")
-
-        if match:
-            correct += 1
-        total += 1
+            print(f"[{total+1}] gold_label={gold_label} gold_text={gold_text} | pred={pred} | match={match}")
+            if match:
+                correct += 1
+            total += 1
 
     print(f"Baseline: {correct}/{total} = {correct/total if total>0 else 0:.4f}")
 
 
-def extract_solution_from_text(text: str, sol_start: str, sol_end: str):
-    # naive extraction of the first occurrence
-    s = text.find(sol_start)
-    if s == -1:
-        return None
-    s2 = text.find(sol_end, s + len(sol_start))
-    if s2 == -1:
-        return text[s + len(sol_start):].strip()
-    return text[s + len(sol_start):s2].strip()
-
-
 # --------------------------
-# SFT pre-finetune (small formatting priming)
+# SFT pre-finetune (train split)
 # --------------------------
 def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
-    """
-    Fallback SFT using transformers + peft (if Unslo th FastLanguageModel is not installed).
-    Saves a LoRA adapter directory at checkpoints/<out_lora_dir>.
-    """
     print("Preparing SFT dataset from:", formatted_jsonl)
     rows = []
     with open(formatted_jsonl, "r", encoding="utf-8") as fh:
         for i, line in enumerate(fh):
             rows.append(json.loads(line))
 
-    # Build 'text' examples: use the messages and include assistant target if present.
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     markers = build_chat_template(tokenizer)
 
     texts = []
     for r in rows:
         messages = r["messages"]
-        # If assistant present, include assistant content as training target.
-        # We'll simply serialize messages via apply_chat_template (fallback) and use that string.
         full = apply_chat_template_to_messages(tokenizer, messages, add_generation_prompt=False, tokenize=False)
         texts.append({"text": full})
 
-    # Convert to HF dataset
     hf_ds = Dataset.from_list(texts)
 
-    # Tokenize
     def tokenize_fn(batch):
         out = tokenizer(batch["text"], truncation=True, max_length=CONFIG["max_seq_length"])
         out["labels"] = out["input_ids"].copy()  # causal LM labels == input_ids
@@ -671,23 +677,18 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
 
     tokenized = hf_ds.map(tokenize_fn, batched=True, remove_columns=["text"])
 
-    # Load base model (transformers)
     import transformers
     from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     print("Loading base model via transformers:", model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")  # device_map auto if you have accelerate/torch >=
-    # If memory is tight, we could load with load_in_8bit via bitsandbytes; for now default.
+    model = AutoModelForCausalLM.from_pretrained(model_name)
 
-    # Prepare model for LoRA (and possible 8-bit)
     try:
         model = prepare_model_for_kbit_training(model)
     except Exception:
-        # prepare_model_for_kbit_training optional; continue if not available
         pass
 
-    # Configure LoRA
     lora_rank = CONFIG["lora_rank"]
     lora_config = LoraConfig(
         r=lora_rank,
@@ -699,7 +700,6 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Small TrainingArguments for quick SFT
     train_args = TrainingArguments(
         output_dir=os.path.join(CONFIG["checkpoints_dir"], out_lora_dir),
         per_device_train_batch_size=CONFIG["sft"]["per_device_train_batch_size"],
@@ -714,7 +714,6 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
         report_to="none",
     )
 
-    # Define data collator for causal LM
     from transformers import DataCollatorForLanguageModeling
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
@@ -725,10 +724,9 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
         data_collator=data_collator,
     )
 
-    print("Starting SFT pre-finetune (transformers+peft)...")
+    print("Starting SFT pre-finetune...")
     trainer.train()
 
-    # Save LoRA weights (PEFT save)
     makedirs(CONFIG["checkpoints_dir"])
     out_path = os.path.join(CONFIG["checkpoints_dir"], out_lora_dir)
     print("Saving LoRA to", out_path)
@@ -739,21 +737,18 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
 
 
 # --------------------------
-# GRPO training
+# GRPO training (train split)
 # --------------------------
 def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path: str = None, out_lora_dir: str = None):
-    """
-    Run GRPO training using trl.GRPOTrainer and the reward functions imported from rewards.py
-    """
     if GRPOTrainer is None or SamplingParams is None:
         raise RuntimeError("trl.GRPOTrainer or vllm.SamplingParams not available. Install required libs.")
 
-    print("Loading formatted dataset...")
+    print("Loading formatted dataset for GRPO...")
     rows = []
     with open(formatted_jsonl, "r", encoding="utf-8") as fh:
         for line in fh:
             rows.append(json.loads(line))
-    # Convert to HF Dataset
+
     prompts = []
     answers = []
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
@@ -761,14 +756,11 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
 
     for r in rows:
         messages = r["messages"]
-        # For generation, we will use chat_template with add_generation_prompt True
         text = apply_chat_template_to_messages(tokenizer, messages, add_generation_prompt=True, tokenize=False)
         prompts.append(text)
-        # collect answer if present
         raw_ans = r["raw"].get("answer")
         answers.append(raw_ans if raw_ans is not None else "")
 
-    # Build vllm sampling params
     sampling = SamplingParams(
         min_p=0.1,
         top_p=1.0,
@@ -778,8 +770,7 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         include_stop_str_in_output=True,
     )
 
-    # Load model via FastLanguageModel
-    print("Loading model (FastLanguageModel)...")
+    print("Loading model (FastLanguageModel) for GRPO...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=CONFIG["max_seq_length"],
@@ -789,7 +780,6 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         gpu_memory_utilization=CONFIG["gpu_memory_utilization"],
     )
 
-    # Apply PEFT
     model = FastLanguageModel.get_peft_model(
         model,
         r=CONFIG["lora_rank"],
@@ -802,7 +792,6 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         random_state=CONFIG["seed"],
     )
 
-    # Optionally load preformat LoRA
     if preformat_lora_path:
         try:
             print("Loading preformat LoRA:", preformat_lora_path)
@@ -810,7 +799,6 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         except Exception as e:
             print("Could not load preformat LoRA:", e)
 
-    # GRPO config (mirror snippet)
     grpo_args = GRPOConfig(
         vllm_sampling_params=sampling,
         temperature=CONFIG["grpo"]["temperature"],
@@ -823,7 +811,7 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         per_device_train_batch_size=CONFIG["grpo"]["per_device_train_batch_size"],
         gradient_accumulation_steps=CONFIG["grpo"]["gradient_accumulation_steps"],
         num_generations=CONFIG["grpo"]["num_generations"],
-        max_prompt_length=512,  # will be adjusted below based on token lengths
+        max_prompt_length=512,
         max_completion_length=CONFIG["max_seq_length"] - 512,
         max_steps=CONFIG["grpo"]["max_steps"],
         save_steps=CONFIG["grpo"]["save_steps"],
@@ -831,7 +819,7 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         output_dir=CONFIG["checkpoints_dir"],
     )
 
-    # adjust max_prompt_length by computing a quantile of prompt token lengths:
+    # compute 90th quantile prompt length
     print("Tokenizing prompts to compute prompt length quantile...")
     token_lens = []
     for p in prompts:
@@ -843,10 +831,8 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
     grpo_args.max_completion_length = CONFIG["max_seq_length"] - grpo_args.max_prompt_length
     print(f"Set max_prompt_length={grpo_args.max_prompt_length} max_completion_length={grpo_args.max_completion_length}")
 
-    # Build a minimal train_dataset from prompts + answers for GRPOTrainer
     train_dataset = Dataset.from_dict({"prompt": prompts, "answer": answers})
 
-    # Reward functions: ensure they are present
     reward_funcs = []
     if match_format_exactly: reward_funcs.append(match_format_exactly)
     if match_format_approximately: reward_funcs.append(match_format_approximately)
@@ -855,7 +841,6 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
     if not reward_funcs:
         raise RuntimeError("No reward functions available. Ensure rewards.py is present and imports succeed.")
 
-    # Create GRPOTrainer
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
@@ -864,10 +849,14 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         train_dataset=train_dataset,
     )
 
-    print("Starting GRPO training (this may take a long time)...")
+    # Workaround for Unsloth trainer assumptions
+    setattr(trainer, 'image_token_id', None)
+    setattr(trainer, 'vision_start_token_id', None)
+    setattr(trainer, 'vision_end_token_id', None)
+
+    print("Starting GRPO training...")
     trainer.train()
 
-    # Save LoRA adapter after training
     makedirs(CONFIG["checkpoints_dir"])
     out_dir = os.path.join(CONFIG["checkpoints_dir"], out_lora_dir or CONFIG["grpo_lora_name"])
     model.save_lora(out_dir)
@@ -876,25 +865,16 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
 
 
 # --------------------------
-# Inference with saved LoRA
+# Inference with LoRA (batched)
 # --------------------------
-def run_inference_with_lora(model_name: str, tokenizer_name: str, lora_path: str, prompts: List[str], max_new_tokens: int = 256):
-    """
-    Inference using Transformers + PEFT (works when Unslo th is not installed).
-    - Loads base model via transformers (device_map='auto' if available).
-    - Loads LoRA adapter using PeftModel.from_pretrained().
-    - Generates outputs and returns list of generated strings (only the newly generated suffix).
-    """
+def run_inference_with_lora(model_name: str, tokenizer_name: str, lora_path: str, prompts: List[str], max_new_tokens: int = 256, batch_size: int = None):
     from transformers import AutoModelForCausalLM
     from peft import PeftModel
     import torch
 
-    print("Loading tokenizer and base model for inference (transformers + peft)...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
 
-    # Try to load base model in float16 and with device_map auto if available to reduce RAM.
     try:
-        # prefer low_cpu_mem_usage + device_map if HF supports it
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else None,
@@ -902,11 +882,10 @@ def run_inference_with_lora(model_name: str, tokenizer_name: str, lora_path: str
             low_cpu_mem_usage=True,
         )
     except Exception as e:
-        print("Warning: couldn't use device_map/float16 shortcut, falling back to simple load:", e)
+        print("Warning: device_map/float16 shortcut failed, falling back:", e)
         model = AutoModelForCausalLM.from_pretrained(model_name)
         model.to(CONFIG["device"])
 
-    # Attach LoRA adapter if available
     if lora_path and os.path.isdir(lora_path):
         try:
             model = PeftModel.from_pretrained(model, lora_path, is_trainable=False)
@@ -919,107 +898,176 @@ def run_inference_with_lora(model_name: str, tokenizer_name: str, lora_path: str
 
     model.eval()
     outputs = []
-    for p in prompts:
-        # tokenize and move to device
-        inputs = tokenizer(p, return_tensors="pt")
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    if batch_size is None:
+        batch_size = CONFIG.get("eval_batch_size", 8)
+
+    device = next(model.parameters()).device
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start:start+batch_size]
+        enc = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=CONFIG["max_seq_length"])
+        enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.no_grad():
             gen_ids = model.generate(
-                **inputs,
+                **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else None,
             )
 
-        # decode full sequence then remove prompt portion to get only generated suffix
-        decoded = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-        prompt_decoded = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=False)
-        if decoded.startswith(prompt_decoded):
-            out = decoded[len(prompt_decoded):].strip()
-        else:
-            out = decoded.strip()
-        outputs.append(out)
+        for i in range(len(batch_prompts)):
+            decoded = tokenizer.decode(gen_ids[i], skip_special_tokens=False)
+            prompt_decoded = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=False)
+            if decoded.startswith(prompt_decoded):
+                out = decoded[len(prompt_decoded):].strip()
+            else:
+                out = decoded.strip()
+            outputs.append(out)
 
     return outputs
 
 
 # --------------------------
-# CLI and orchestration
+# CLI orchestration — validation used for all testing
 # --------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Compact MedMCQA -> GRPO pipeline (single-file)")
+    parser = argparse.ArgumentParser(description="MedMCQA -> GRPO pipeline (validation used for testing)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("download", help="Download and process MedMCQA dataset")
-    sub.add_parser("prep", help="Build chat template and format dataset for SFT/GRPO")
-    sub.add_parser("baseline", help="Run baseline evaluation (generate answers with base model)")
-    sub.add_parser("sft", help="Run SFT pre-finetune to teach formatting")
-    sub.add_parser("grpo", help="Run GRPO training")
-    sub.add_parser("eval", help="Run inference using saved LoRA")
+    sub.add_parser("download", help="Download and process MedMCQA dataset (writes per-split files)")
+    sub.add_parser("prep", help="Build chat template and format dataset for SFT/GRPO (train + validation)")
+    sub.add_parser("baseline", help="Run baseline evaluation on validation split (batched)")
+    sub.add_parser("sft", help="Run SFT pre-finetune on train split to teach formatting")
+    sub.add_parser("grpo", help="Run GRPO training on train split (then evaluate on validation)")
+    sub.add_parser("eval", help="Run inference on validation using saved LoRA")
     sub.add_parser("all", help="Run entire pipeline in sequence (download->prep->baseline->sft->grpo->eval)")
 
-    parser.add_argument("--limit", type=int, default=200, help="limit number of examples to process (for quick tests)")
+    parser.add_argument("--limit", type=int, default=5000, help="limit number of examples to process (0 or negative = no limit)")
     parser.add_argument("--model_name", type=str, default=CONFIG["model_name"])
-    parser.add_argument("--formatted_jsonl", type=str, default=os.path.join(CONFIG["data_dir"], "medmcqa_formatted.jsonl"))
-    parser.add_argument("--processed_jsonl", type=str, default=os.path.join(CONFIG["data_dir"], "medmcqa_processed.jsonl"))
+    parser.add_argument("--processed_dir", type=str, default=CONFIG["data_dir"])
+    parser.add_argument("--formatted_dir", type=str, default=CONFIG["data_dir"])
     parser.add_argument("--preformat_lora", type=str, default=os.path.join(CONFIG["checkpoints_dir"], CONFIG["preformat_lora_name"]))
     parser.add_argument("--grpo_lora", type=str, default=os.path.join(CONFIG["checkpoints_dir"], CONFIG["grpo_lora_name"]))
+    parser.add_argument("--batch_size", type=int, default=CONFIG["eval_batch_size"], help="batch size for eval/inference")
     args = parser.parse_args()
 
     makedirs(CONFIG["data_dir"], CONFIG["checkpoints_dir"], CONFIG["experiments_dir"])
 
+    # interpret limit: 0 or negative => no limit
+    limit = args.limit if args.limit and args.limit > 0 else None
+
     if args.cmd == "download":
-        download_medmcqa(args.processed_jsonl)
+        download_medmcqa(args.processed_dir)
 
     elif args.cmd == "prep":
-        # build tokenizer & template
         print("Loading tokenizer to build chat template...")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
         markers = build_chat_template(tokenizer)
-        # format dataset for SFT/GRPO
-        format_medmcqa_for_chat(args.processed_jsonl, args.formatted_jsonl, tokenizer, markers, subset_limit=args.limit)
+        # Only format train & validation (ignore test)
+        for split in ["train", "validation"]:
+            in_path = os.path.join(args.processed_dir, f"medmcqa_processed.{split}.jsonl")
+            out_path = os.path.join(args.formatted_dir, f"medmcqa_formatted.{split}.jsonl")
+            if os.path.exists(in_path):
+                format_medmcqa_for_chat(in_path, out_path, tokenizer, markers, subset_limit=limit)
+            else:
+                print(f"Skipping split {split} (not found): {in_path}")
 
     elif args.cmd == "baseline":
-        baseline_evaluate_model(args.model_name, args.formatted_jsonl, tokenizer_name=args.model_name, limit=args.limit)
+        val_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.validation.jsonl")
+        if not os.path.exists(val_formatted):
+            print("Validation formatted file not found:", val_formatted)
+            return
+        baseline_evaluate_model(args.model_name, val_formatted, tokenizer_name=args.model_name, limit=limit, batch_size=args.batch_size)
 
     elif args.cmd == "sft":
-        out = run_sft_pretrain(args.formatted_jsonl, args.model_name, CONFIG["preformat_lora_name"])
+        train_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.train.jsonl")
+        if not os.path.exists(train_formatted):
+            print("Train formatted file not found:", train_formatted)
+            return
+        out = run_sft_pretrain(train_formatted, args.model_name, CONFIG["preformat_lora_name"])
         print("SFT pretrain done, saved:", out)
 
     elif args.cmd == "grpo":
-        out = run_grpo_training(args.formatted_jsonl, args.model_name, preformat_lora_path=args.preformat_lora, out_lora_dir=CONFIG["grpo_lora_name"])
+        train_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.train.jsonl")
+        val_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.validation.jsonl")
+        if not os.path.exists(train_formatted):
+            print("Train formatted file not found:", train_formatted)
+            return
+        out = run_grpo_training(train_formatted, args.model_name, preformat_lora_path=args.preformat_lora, out_lora_dir=CONFIG["grpo_lora_name"])
         print("GRPO done, saved:", out)
 
+        # quick eval on validation
+        if os.path.exists(val_formatted):
+            print("Running quick validation-set eval with GRPO LoRA...")
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+            markers = build_chat_template(tokenizer)
+            prompts = []
+            rows = []
+            with open(val_formatted, "r", encoding="utf-8") as fh:
+                for i, line in enumerate(fh):
+                    if limit and i >= min(200, limit): break
+                    row = json.loads(line)
+                    prompts.append(apply_chat_template_to_messages(tokenizer, row["messages"], add_generation_prompt=True, tokenize=False))
+                    rows.append(row)
+            outputs = run_inference_with_lora(args.model_name, args.model_name, args.grpo_lora, prompts, max_new_tokens=128, batch_size=args.batch_size)
+            correct = 0
+            total = 0
+            for i, out in enumerate(outputs):
+                sol = extract_pred_with_fallback(out, markers["solution_start"], markers["solution_end"], options=rows[i].get("raw", {}).get("options"))
+                ex = rows[i]
+                gold_label = ex.get("answer_label") or (ex.get("raw", {}) or {}).get("answer_label")
+                gold_text = ex.get("answer_text") or (ex.get("raw", {}) or {}).get("answer_text")
+                match = False
+                if gold_label:
+                    if sol and sol.strip().upper() == str(gold_label).strip().upper(): match = True
+                    elif sol and str(gold_label).strip().upper() in sol.strip().upper(): match = True
+                elif gold_text:
+                    if sol and sol.strip().lower() in str(gold_text).strip().lower(): match = True
+                print(f"[{i+1}] gold_label={gold_label} gold_text={gold_text} | pred={sol} | match={match}")
+                if match: correct += 1
+                total += 1
+            print(f"GRPO validation eval: {correct}/{total} = {correct/total if total>0 else 0:.4f}")
+
     elif args.cmd == "eval":
-        # run a few interactive prompts with the grpo lora
+        val_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.validation.jsonl")
+        if not os.path.exists(val_formatted):
+            print("Validation formatted file not found:", val_formatted)
+            return
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
         markers = build_chat_template(tokenizer)
-        # load a few prompts from formatted_jsonl
         prompts = []
-        with open(args.formatted_jsonl, "r", encoding="utf-8") as fh:
+        rows = []
+        with open(val_formatted, "r", encoding="utf-8") as fh:
             for i, line in enumerate(fh):
-                if i >= 10:
-                    break
+                if limit and i >= min(20, limit): break
                 row = json.loads(line)
-                text = apply_chat_template_to_messages(tokenizer, row["messages"], add_generation_prompt=True, tokenize=False)
-                prompts.append(text)
-        outputs = run_inference_with_lora(args.model_name, args.model_name, args.grpo_lora, prompts, max_new_tokens=256)
+                prompts.append(apply_chat_template_to_messages(tokenizer, row["messages"], add_generation_prompt=True, tokenize=False))
+                rows.append(row)
+        outputs = run_inference_with_lora(args.model_name, args.model_name, args.grpo_lora, prompts, max_new_tokens=256, batch_size=args.batch_size)
         for i, out in enumerate(outputs):
-            sol = extract_solution_from_text(out, markers["solution_start"], markers["solution_end"])
+            sol = extract_pred_with_fallback(out, markers["solution_start"], markers["solution_end"], options=rows[i].get("raw", {}).get("options"))
             print(f"=== Example {i} ===\nGen:\n{out}\nExtracted solution: {sol}\n")
 
     elif args.cmd == "all":
-        # run everything in sequence with small limits for quick test
-        download_medmcqa(args.processed_jsonl)
+        # Full pipeline: download -> prep (train + validation) -> baseline (small) -> sft -> grpo -> eval (validation)
+        download_medmcqa(args.processed_dir)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
         markers = build_chat_template(tokenizer)
-        format_medmcqa_for_chat(args.processed_jsonl, args.formatted_jsonl, tokenizer, markers, subset_limit=args.limit)
-        baseline_evaluate_model(args.model_name, args.formatted_jsonl, tokenizer_name=args.model_name, limit=min(50, args.limit))
-        run_sft_pretrain(args.formatted_jsonl, args.model_name, CONFIG["preformat_lora_name"])
-        run_grpo_training(args.formatted_jsonl, args.model_name, preformat_lora_path=os.path.join(CONFIG["checkpoints_dir"], CONFIG["preformat_lora_name"]))
-        print("Pipeline complete. Inspect checkpoints/ and experiments/ for outputs.")
+        for split in ["train", "validation"]:
+            in_path = os.path.join(args.processed_dir, f"medmcqa_processed.{split}.jsonl")
+            out_path = os.path.join(args.formatted_dir, f"medmcqa_formatted.{split}.jsonl")
+            if os.path.exists(in_path):
+                # default: use full split unless --limit provided
+                format_medmcqa_for_chat(in_path, out_path, tokenizer, markers, subset_limit=limit)
+        val_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.validation.jsonl")
+        if os.path.exists(val_formatted):
+            baseline_evaluate_model(args.model_name, val_formatted, tokenizer_name=args.model_name, limit=50, batch_size=args.batch_size)
+        train_formatted = os.path.join(args.formatted_dir, "medmcqa_formatted.train.jsonl")
+        if os.path.exists(train_formatted):
+            run_sft_pretrain(train_formatted, args.model_name, CONFIG["preformat_lora_name"])
+            run_grpo_training(train_formatted, args.model_name, preformat_lora_path=os.path.join(CONFIG["checkpoints_dir"], CONFIG["preformat_lora_name"]))
+        print("Pipeline complete. Validation split used for all testing/evaluation.")
 
     else:
         parser.print_help()
