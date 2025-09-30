@@ -322,8 +322,12 @@ def apply_chat_template_to_messages(tokenizer, messages: List[Dict[str, str]], a
 
 # --------------------------
 # Format dataset to chat-style (train + validation)
-# --------------------------
 def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: Dict[str, str], subset_limit: int = None):
+    """
+    Convert processed medmcqa jsonl into chat-format strings for SFT/GRPO.
+    New: if the dataset contains a gold explanation under raw['exp'] (or raw['explanation']),
+    place that text between the reasoning markers so SFT learns to imitate it.
+    """
     makedirs(os.path.dirname(out_jsonl) or ".")
     system_prompt = markers["system_prompt"]
     reasoning_start = markers["reasoning_start"]
@@ -339,6 +343,7 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
             ex = json.loads(line)
             q = ex["question"]
             options = ex.get("options") or []
+            # Format choices with labels A., B., etc.
             if options:
                 labeled = [f"{chr(ord('A')+idx)}. {opt}" for idx, opt in enumerate(options)]
                 choices_text = "\n".join(labeled)
@@ -357,32 +362,45 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
                 {"role": "user", "content": prompt_text},
             ]
 
+            # pick gold label/text if available
             answer_label = ex.get("answer_label")
             answer_text = ex.get("answer_text")
+
+            # dataset-provided explanation (preferred)
+            gold_exp = None
+            raw = ex.get("raw", {}) if isinstance(ex.get("raw"), dict) else {}
+            # common keys: 'exp', 'explanation', 'explain'
+            for k in ("exp", "explanation", "explain"):
+                if isinstance(raw, dict) and raw.get(k):
+                    gold_exp = str(raw.get(k)).strip()
+                    break
+
+            # construct assistant target: reasoning region contains gold_exp (if present);
+            # solution region contains the gold answer label (if known) or answer_text otherwise.
             if answer_label is not None:
-                assistant_content = (
-                    f"{reasoning_start}Working...{reasoning_end}"
-                    f"{solution_start}{answer_label}{solution_end}"
-                )
-                messages.append({"role": "assistant", "content": assistant_content})
+                sol_text = answer_label
             elif answer_text is not None and options:
+                # try to derive label from answer_text
                 label = None
                 for j, opt in enumerate(options):
                     if answer_text.strip().lower() == opt.strip().lower() or answer_text.strip() in opt:
                         label = chr(ord("A")+j)
                         break
                 if label is not None:
-                    assistant_content = (
-                        f"{reasoning_start}Working...{reasoning_end}"
-                        f"{solution_start}{label}{solution_end}"
-                    )
-                    messages.append({"role": "assistant", "content": assistant_content})
+                    sol_text = label
                 else:
-                    assistant_content = (
-                        f"{reasoning_start}Working...{reasoning_end}"
-                        f"{solution_start}{answer_text}{solution_end}"
-                    )
-                    messages.append({"role": "assistant", "content": assistant_content})
+                    sol_text = answer_text
+            else:
+                sol_text = ""
+
+            # If gold_exp exists, place it in reasoning markers; else keep reasoning empty so SFT learns to generate.
+            reasoning_content = gold_exp or ""
+            assistant_content = f"{reasoning_start}{reasoning_content}{reasoning_end}{solution_start}{sol_text}{solution_end}"
+
+            # add assistant target only if we have some gold info (so SFT can learn)
+            # When the dataset has no gold label/text, we still include the prompt (for generation/GRPO).
+            if sol_text or reasoning_content:
+                messages.append({"role": "assistant", "content": assistant_content})
 
             out_lines.append({"id": ex.get("id"), "messages": messages, "raw": ex})
 
@@ -391,6 +409,7 @@ def format_medmcqa_for_chat(in_jsonl: str, out_jsonl: str, tokenizer, markers: D
             fh.write(json.dumps(row) + "\n")
     print(f"Wrote formatted dataset to {out_jsonl} (n={len(out_lines)})")
     return out_lines
+
 
 
 # --------------------------
@@ -739,38 +758,104 @@ def run_sft_pretrain(formatted_jsonl: str, model_name: str, out_lora_dir: str):
 # --------------------------
 # GRPO training (train split)
 # --------------------------
-def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path: str = None, out_lora_dir: str = None):
+def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path: str = None, out_lora_dir: str = None, require_label: bool = True):
+    """
+    Robust GRPO training entrypoint for MedMCQA.
+
+    - formatted_jsonl: path to formatted dataset (JSONL)
+    - model_name: base model HF id (for FastLanguageModel.from_pretrained)
+    - preformat_lora_path: optional LoRA adapter to load before GRPO
+    - out_lora_dir: output subdirectory name under CONFIG['checkpoints_dir'] to save GRPO LoRA
+    - require_label: if True, filter dataset to examples that have gold label/text (cop != -1 or answer present)
+    """
     if GRPOTrainer is None or SamplingParams is None:
         raise RuntimeError("trl.GRPOTrainer or vllm.SamplingParams not available. Install required libs.")
 
-    print("Loading formatted dataset for GRPO...")
-    rows = []
+    print("Loading formatted dataset for GRPO:", formatted_jsonl)
+    rows_all = []
     with open(formatted_jsonl, "r", encoding="utf-8") as fh:
         for line in fh:
-            rows.append(json.loads(line))
+            rows_all.append(json.loads(line))
+    if len(rows_all) == 0:
+        raise RuntimeError(f"No examples found in {formatted_jsonl}")
+    print(f"Total examples in file: {len(rows_all)}")
 
-    prompts = []
-    answers = []
+    # Helper: robust gold resolution (top-level or inside raw; handles cop indexing)
+    def resolve_gold_from_row(row):
+        gold_label = None
+        gold_text = None
+        if not isinstance(row, dict):
+            return None, None
+        if row.get("answer_label"):
+            gold_label = row.get("answer_label")
+        if row.get("answer_text"):
+            gold_text = row.get("answer_text")
+        raw = row.get("raw") or {}
+        if isinstance(raw, dict):
+            if gold_label is None and raw.get("answer_label"):
+                gold_label = raw.get("answer_label")
+            if gold_text is None and raw.get("answer_text"):
+                gold_text = raw.get("answer_text")
+            if gold_text is None and raw.get("answer"):
+                gold_text = raw.get("answer")
+            if raw.get("cop") is not None and (gold_label is None and gold_text is None):
+                try:
+                    idx = int(raw.get("cop"))
+                    opts = raw.get("options") or row.get("options") or []
+                    if idx == -1:
+                        # explicit unlabeled
+                        pass
+                    elif 0 <= idx < len(opts):
+                        gold_label = chr(ord("A") + idx)
+                        gold_text = opts[idx]
+                    elif 1 <= idx <= len(opts):
+                        gold_label = chr(ord("A") + (idx - 1))
+                        gold_text = opts[idx - 1]
+                except Exception:
+                    s = str(raw.get("cop")).strip()
+                    if s:
+                        gold_text = gold_text or s
+        return gold_label, gold_text
+
+    # Filter to labeled examples if requested
+    rows = rows_all
+    if require_label:
+        kept = []
+        for r in rows_all:
+            lbl, txt = resolve_gold_from_row(r)
+            if lbl is not None or txt is not None:
+                kept.append(r)
+        print(f"Filtered training rows: kept {len(kept)}/{len(rows_all)} examples with gold label/text.")
+        rows = kept
+        if len(rows) == 0:
+            raise RuntimeError("No labeled examples after filtering. Set require_label=False or fix processed dataset (cop != -1 or answer_label present).")
+
+    # Tokenizer + markers
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     markers = build_chat_template(tokenizer)
 
+    # Build prompts + answers arrays
+    prompts = []
+    answers = []
     for r in rows:
-        messages = r["messages"]
-        text = apply_chat_template_to_messages(tokenizer, messages, add_generation_prompt=True, tokenize=False)
-        prompts.append(text)
-        raw_ans = r["raw"].get("answer")
-        answers.append(raw_ans if raw_ans is not None else "")
+        prompts.append(apply_chat_template_to_messages(tokenizer, r["messages"], add_generation_prompt=True, tokenize=False))
+        lbl, txt = resolve_gold_from_row(r)
+        answers.append(txt or lbl or "")
 
+    print(f"Prepared {len(prompts)} prompts for GRPO (after filtering).")
+
+    # vllm sampling params
     sampling = SamplingParams(
         min_p=0.1,
         top_p=1.0,
         top_k=-1,
-        seed=CONFIG["seed"],
+        seed=CONFIG.get("seed", 3407),
         stop=[tokenizer.eos_token] if hasattr(tokenizer, "eos_token") else None,
         include_stop_str_in_output=True,
     )
 
-    print("Loading model (FastLanguageModel) for GRPO...")
+    # Load model via FastLanguageModel
+    print("Loading model (FastLanguageModel)...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=CONFIG["max_seq_length"],
@@ -780,6 +865,8 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         gpu_memory_utilization=CONFIG["gpu_memory_utilization"],
     )
 
+    # Apply PEFT/LoRA
+    print("Applying PEFT/LoRA wrappers to model...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=CONFIG["lora_rank"],
@@ -789,16 +876,18 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         ],
         lora_alpha=CONFIG["lora_rank"] * 2,
         use_gradient_checkpointing="unsloth",
-        random_state=CONFIG["seed"],
+        random_state=CONFIG.get("seed", 3407),
     )
 
     if preformat_lora_path:
         try:
             print("Loading preformat LoRA:", preformat_lora_path)
             model.load_lora(preformat_lora_path)
+            print("Preformat LoRA loaded.")
         except Exception as e:
-            print("Could not load preformat LoRA:", e)
+            print("Could not load preformat LoRA (continuing):", e)
 
+    # GRPO args
     grpo_args = GRPOConfig(
         vllm_sampling_params=sampling,
         temperature=CONFIG["grpo"]["temperature"],
@@ -819,50 +908,220 @@ def run_grpo_training(formatted_jsonl: str, model_name: str, preformat_lora_path
         output_dir=CONFIG["checkpoints_dir"],
     )
 
-    # compute 90th quantile prompt length
+    # Compute prompt length quantile
     print("Tokenizing prompts to compute prompt length quantile...")
     token_lens = []
     for p in prompts:
-        ids = tokenizer(p, return_tensors="pt")["input_ids"][0]
-        token_lens.append(ids.shape[0])
+        try:
+            ids = tokenizer(p, return_tensors="pt")["input_ids"][0]
+            token_lens.append(int(ids.shape[0]))
+        except Exception:
+            token_lens.append(min(len(p.split()), CONFIG["max_seq_length"] // 4))
     import numpy as np
-    max_prompt_length = int(np.quantile(np.array(token_lens), 0.9))
+    try:
+        max_prompt_length = int(np.quantile(np.array(token_lens), 0.9))
+    except Exception:
+        max_prompt_length = min(max(token_lens) if token_lens else 512, 512)
     grpo_args.max_prompt_length = max_prompt_length + 1
     grpo_args.max_completion_length = CONFIG["max_seq_length"] - grpo_args.max_prompt_length
-    print(f"Set max_prompt_length={grpo_args.max_prompt_length} max_completion_length={grpo_args.max_completion_length}")
+    print(f"Set max_prompt_length={grpo_args.max_prompt_length}, max_completion_length={grpo_args.max_completion_length}")
 
+    # Build HF dataset
     train_dataset = Dataset.from_dict({"prompt": prompts, "answer": answers})
 
-    reward_funcs = []
-    if match_format_exactly: reward_funcs.append(match_format_exactly)
-    if match_format_approximately: reward_funcs.append(match_format_approximately)
-    if check_answer: reward_funcs.append(check_answer)
-    if check_numbers: reward_funcs.append(check_numbers)
-    if not reward_funcs:
+    # Collect reward functions
+    raw_reward_fns = []
+    if match_format_exactly: raw_reward_fns.append(match_format_exactly)
+    if match_format_approximately: raw_reward_fns.append(match_format_approximately)
+    if check_answer: raw_reward_fns.append(check_answer)
+    if check_numbers: raw_reward_fns.append(check_numbers)
+    if not raw_reward_fns:
         raise RuntimeError("No reward functions available. Ensure rewards.py is present and imports succeed.")
 
+    print(f"Wrapping {len(raw_reward_fns)} reward functions for GRPO trainer (batch-aware).")
+
+    # Debug control
+    first_call_debug = {"seen": False, "printed_sample": False}
+
+    # Batch-aware wrapper
+    def make_batch_wrapper(fn):
+        name = getattr(fn, "__name__", "reward_fn")
+
+        def wrapped(completions, prompts_arg=None, completion_ids=None, **kwargs):
+            # One-time debug print
+            if not first_call_debug["seen"]:
+                print("=== REWARD WRAPPER FIRST CALL DEBUG ===")
+                print("wrapped fn:", name)
+                print("completions type:", type(completions))
+                if isinstance(completions, (list, tuple)):
+                    print("len(completions):", len(completions))
+                    if len(completions) > 0:
+                        preview = completions[0]
+                        print("first completion preview (truncated):", (str(preview)[:500] + "...") if preview else None)
+                print("prompts_arg type:", type(prompts_arg))
+                print("completion_ids type:", type(completion_ids), "sample:", (completion_ids[:4] if isinstance(completion_ids, (list,tuple)) else completion_ids))
+                first_call_debug["seen"] = True
+
+            flat_comps = []
+            comp_to_idx = []
+
+            # If completion_ids provided and elements are scalar ints -> try to use them.
+            # If completion_ids elements are lists (token ids), treat them as token lists and fallback to positional mapping.
+            if isinstance(completion_ids, (list, tuple)):
+                # If completions align with completion_ids by length
+                if isinstance(completions, (list, tuple)) and len(completions) == len(completion_ids):
+                    for i, comp_entry in enumerate(completions):
+                        target_idx = completion_ids[i]
+                        # If trainer provided token-id list here, interpret as "not an index" -> fallback to i
+                        if isinstance(target_idx, (list, tuple)):
+                            mapped_idx = i
+                        else:
+                            # try to coerce to int when possible
+                            try:
+                                mapped_idx = int(target_idx)
+                            except Exception:
+                                mapped_idx = i
+                        if isinstance(comp_entry, (list, tuple)):
+                            for cc in comp_entry:
+                                flat_comps.append(cc)
+                                comp_to_idx.append(mapped_idx)
+                        else:
+                            flat_comps.append(comp_entry)
+                            comp_to_idx.append(mapped_idx)
+                else:
+                    # fallback flatten & map by index where possible
+                    if isinstance(completions, (list, tuple)):
+                        for i, comp_entry in enumerate(completions):
+                            mapped_idx = None
+                            if i < len(completion_ids):
+                                cand = completion_ids[i]
+                                if isinstance(cand, (list, tuple)):
+                                    mapped_idx = i
+                                else:
+                                    try:
+                                        mapped_idx = int(cand)
+                                    except Exception:
+                                        mapped_idx = i
+                            else:
+                                mapped_idx = i
+                            if isinstance(comp_entry, (list, tuple)):
+                                for cc in comp_entry:
+                                    flat_comps.append(cc)
+                                    comp_to_idx.append(mapped_idx)
+                            else:
+                                flat_comps.append(comp_entry)
+                                comp_to_idx.append(mapped_idx)
+                    else:
+                        flat_comps = [completions]
+                        comp_to_idx = [0]
+            else:
+                # No completion_ids: rely on structure of completions and prompts_arg
+                if isinstance(completions, (list, tuple)):
+                    # If nested lists and prompts_arg is list -> map sublists to prompt indices
+                    if len(completions) > 0 and isinstance(completions[0], (list, tuple)) and isinstance(prompts_arg, (list, tuple)):
+                        for pi, sub in enumerate(completions):
+                            for cc in (sub if isinstance(sub, (list, tuple)) else [sub]):
+                                flat_comps.append(cc)
+                                comp_to_idx.append(pi if pi < len(prompts_arg) else 0)
+                    else:
+                        for i, c in enumerate(completions):
+                            flat_comps.append(c)
+                            comp_to_idx.append(i if isinstance(prompts_arg, (list, tuple)) and i < len(prompts_arg) else 0)
+                else:
+                    flat_comps = [completions]
+                    comp_to_idx = [0]
+
+            # Compute reward for each flattened completion
+            rewards_out = []
+            for comp, ex_idx in zip(flat_comps, comp_to_idx):
+                ex_obj = rows[ex_idx] if (isinstance(ex_idx, int) and 0 <= ex_idx < len(rows)) else None
+                prompt_for_call = None
+                if isinstance(prompts_arg, (list, tuple)) and isinstance(ex_idx, int) and ex_idx < len(prompts_arg):
+                    prompt_for_call = prompts_arg[ex_idx]
+                elif isinstance(prompts_arg, str):
+                    prompt_for_call = prompts_arg
+
+                val = None
+                try:
+                    if ex_obj is not None:
+                        try:
+                            val = fn(comp, prompt_for_call, ex_obj, markers)
+                        except TypeError:
+                            try:
+                                val = fn(comp, prompt_for_call, ex_obj)
+                            except TypeError:
+                                val = None
+                    if val is None:
+                        try:
+                            val = fn(comp, prompt_for_call)
+                        except TypeError:
+                            try:
+                                val = fn(comp)
+                            except Exception:
+                                val = None
+                except Exception as e:
+                    print(f"Reward function {name} raised for ex_idx={ex_idx}: {e}")
+                    val = None
+
+                # normalize to float
+                if isinstance(val, (int, float)):
+                    rewards_out.append(float(val))
+                elif isinstance(val, (list, tuple)):
+                    try:
+                        rewards_out.append(float(val[0]) if len(val) > 0 else 0.0)
+                    except Exception:
+                        rewards_out.append(0.0)
+                else:
+                    rewards_out.append(0.0)
+
+            if first_call_debug.get("seen") and not first_call_debug.get("printed_sample"):
+                print("=== REWARD WRAPPER SAMPLE OUTPUT ===")
+                print("flat_comps_count:", len(flat_comps))
+                print("comp_to_idx sample:", comp_to_idx[:10])
+                print("rewards_out sample:", rewards_out[:10])
+                first_call_debug["printed_sample"] = True
+
+            return rewards_out
+
+        return wrapped
+
+    # Wrap raw reward functions
+    wrapped_reward_funcs = [make_batch_wrapper(fn) for fn in raw_reward_fns]
+
+    # Create GRPOTrainer
+    print("Creating GRPOTrainer with args:", grpo_args)
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=reward_funcs,
+        reward_funcs=wrapped_reward_funcs,
         args=grpo_args,
         train_dataset=train_dataset,
     )
 
-    # Workaround for Unsloth trainer assumptions
+    # Workaround: clear vision tokens for text-only models
     setattr(trainer, 'image_token_id', None)
     setattr(trainer, 'vision_start_token_id', None)
     setattr(trainer, 'vision_end_token_id', None)
 
-    print("Starting GRPO training...")
+    print("Starting GRPO training (this may take a while)...")
     trainer.train()
 
+    # Save LoRA adapter
     makedirs(CONFIG["checkpoints_dir"])
     out_dir = os.path.join(CONFIG["checkpoints_dir"], out_lora_dir or CONFIG["grpo_lora_name"])
-    model.save_lora(out_dir)
-    print("Saved GRPO LoRA to", out_dir)
-    return out_dir
+    try:
+        model.save_lora(out_dir)
+        print("Saved GRPO LoRA to", out_dir)
+    except Exception as e:
+        print("Failed to save GRPO LoRA via model.save_lora():", e)
+        try:
+            trainer.save_model(out_dir)
+            print("Trainer saved model to", out_dir)
+        except Exception as e2:
+            print("Also failed to save via trainer.save_model():", e2)
+            raise
 
+    return out_dir
 
 # --------------------------
 # Inference with LoRA (batched)

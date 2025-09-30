@@ -1,0 +1,9 @@
+{
+  "baseline_correct": 2094,
+  "sft_correct": 2323,
+  "grpo_correct": 2149,
+  "total": 4183,
+  "baseline_acc": 0.5005976571838393,
+  "sft_acc": 0.5553430552235238,
+  "grpo_acc": 0.513746115228305
+}

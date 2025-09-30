@@ -21,10 +21,10 @@ echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 # This runs run.py all (which calls download->prep->baseline->sft->grpo->eval)
 # python run.py download
 # python run.py prep
-# python run.py baseline
+# # python run.py baseline
 # python run.py sft
-# python run.py grpo
-python run.py eval
+python run.py grpo
+# python run.py eval
 
 
 
